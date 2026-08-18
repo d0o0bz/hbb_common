@@ -2107,6 +2107,16 @@ serde_field_bool!(
     "ViewOnly::default_view_only"
 );
 
+// dec: low_power_mode — 本机端 macOS 双显卡优化开关。
+// 开启后 video_service 会降低 CGDisplayStream 帧率节流、禁用 Retina 全分辨率捕获，
+// 并优先使用集成显卡，避免不必要地唤醒独立显卡。
+serde_field_bool!(
+    LowPowerMode,
+    "low-power-mode",
+    default_low_power_mode,
+    "LowPowerMode::default_low_power_mode"
+);
+
 serde_field_bool!(
     ShowMyCursor,
     "show_my_cursor",
