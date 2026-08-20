@@ -236,7 +236,7 @@ pub struct Socks5Server {
 }
 
 // dec: 多配置支持 - ServerConfig结构体
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerConfig {
     pub id: String,
     pub name: String,
@@ -303,7 +303,9 @@ impl Default for ServerConfig {
             is_available: false,
         }
     }
+}
 
+impl ServerConfig {
     // dec: 多配置支持 - 配置校验方法
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.name.is_empty() {
@@ -577,7 +579,7 @@ impl AvailabilityChecker {
         ServerStatus::NotConfigured
     }
 
-    pub fn measure_latency(host: &str, port: i32) -> Option<i64> {
+    pub fn measure_latency(_host: &str, _port: i32) -> Option<i64> {
         // 测量网络延迟
         // 返回延迟毫秒数
         None
@@ -617,7 +619,7 @@ impl ManualSwitcher {
         // 更新当前配置
         // 持久化配置
         
-        if let Err(_) = AvailabilityChecker::check_id_server(config) {
+        if AvailabilityChecker::check_id_server(config) != ServerStatus::Available {
             return Err(SwitchError::ConfigUnavailable("ID服务器不可用".to_string()));
         }
         
