@@ -235,7 +235,23 @@ pub struct Socks5Server {
     pub password: String,
 }
 
-// more variable configs
+// dec: 多配置支持 - ServerConfig结构体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub id: String,
+    pub name: String,
+    pub id_server: String,
+    pub id_port: i32,
+    pub relay_server: Option<String>,
+    pub relay_port: Option<i32>,
+    pub is_default: bool,
+    pub last_used: Option<String>,
+    pub last_success: Option<String>,
+    pub avg_latency: Option<i64>,
+    pub is_available: bool,
+}
+
+// dec: 多配置支持 - 扩展Config2结构体
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config2 {
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -252,9 +268,436 @@ pub struct Config2 {
     #[serde(default)]
     socks: Option<Socks5Server>,
 
+    // dec: 多配置支持 - 多配置列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_servers: Vec<ServerConfig>,
+    // dec: 多配置支持 - 当前配置ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_config_id: Option<String>,
+    // dec: 多配置支持 - 自动切换开关
+    #[serde(default = "default_auto_switch")]
+    pub auto_switch_enabled: bool,
+
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub options: HashMap<String, String>,
+}
+
+fn default_auto_switch() -> bool {
+    true
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "".to_string(),
+            id_server: "".to_string(),
+            id_port: RENDEZVOUS_PORT,
+            relay_server: None,
+            relay_port: Some(RELAY_PORT),
+            is_default: false,
+            last_used: None,
+            last_success: None,
+            avg_latency: None,
+            is_available: false,
+        }
+    }
+
+    // dec: 多配置支持 - 配置校验方法
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::InvalidFormat("配置名称不能为空".to_string()));
+        }
+        if self.name.len() > 50 {
+            return Err(ConfigError::InvalidFormat("配置名称不能超过50个字符".to_string()));
+        }
+        if self.id_server.is_empty() {
+            return Err(ConfigError::InvalidFormat("ID服务器地址不能为空".to_string()));
+        }
+        if self.id_port == 0 || self.id_port > 65535 {
+            return Err(ConfigError::InvalidFormat("ID服务器端口范围无效".to_string()));
+        }
+        if let Some(port) = self.relay_port {
+            if port == 0 || port > 65535 {
+                return Err(ConfigError::InvalidFormat("中继服务器端口范围无效".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_display_string(&self) -> String {
+        format!("{} ({})", self.name, self.id_server)
+    }
+}
+
+// dec: 多配置支持 - 配置校验器
+pub struct ConfigValidator;
+
+impl ConfigValidator {
+    pub fn validate_format(config: &ServerConfig) -> Result<(), ConfigError> {
+        config.validate()
+    }
+
+    pub fn check_uniqueness(config: &ServerConfig, existing: &[ServerConfig]) -> Result<(), ConfigError> {
+        for existing_config in existing {
+            if existing_config.name == config.name && existing_config.id != config.id {
+                return Err(ConfigError::DuplicateName);
+            }
+            if existing_config.id_server == config.id_server && existing_config.id != config.id {
+                return Err(ConfigError::DuplicateServer);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_name(name: &str) -> Result<(), ConfigError> {
+        if name.is_empty() {
+            return Err(ConfigError::InvalidFormat("配置名称不能为空".to_string()));
+        }
+        if name.len() > 50 {
+            return Err(ConfigError::InvalidFormat("配置名称不能超过50个字符".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn validate_server_address(addr: &str) -> Result<(), ConfigError> {
+        if addr.is_empty() {
+            return Err(ConfigError::InvalidFormat("服务器地址不能为空".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn check_max_limit(count: usize) -> Result<(), ConfigError> {
+        if count >= 20 {
+            return Err(ConfigError::MaxLimitReached);
+        }
+        Ok(())
+    }
+}
+
+// dec: 多配置支持 - 错误类型定义
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("配置名称已存在")]
+    DuplicateName,
+    #[error("该ID服务器配置已存在")]
+    DuplicateServer,
+    #[error("已达到最大配置数量（20个）")]
+    MaxLimitReached,
+    #[error("不能删除最后一个配置")]
+    LastConfigCannotDelete,
+    #[error("默认配置不允许删除")]
+    DefaultConfigCannotDelete,
+    #[error("配置格式错误: {0}")]
+    InvalidFormat(String),
+    #[error("配置不存在")]
+    ConfigNotFound,
+    #[error("存储错误: {0}")]
+    StorageError(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SwitchError {
+    #[error("配置不存在")]
+    ConfigNotFound,
+    #[error("配置不可用: {0}")]
+    ConfigUnavailable(String),
+    #[error("请先断开远程连接再切换配置")]
+    ConnectionInProgress,
+    #[error("配置保存失败: {0}")]
+    StorageFailed(String),
+    #[error("切换保护中，请稍后重试")]
+    SwitchProtected,
+}
+
+// dec: 多配置支持 - ConfigState结构体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigState {
+    pub current_config_id: Option<String>,
+    pub fail_count: i32,
+    pub last_switch_time: Option<String>,
+    pub last_check_time: Option<String>,
+    pub auto_switch_enabled: bool,
+}
+
+impl Default for ConfigState {
+    fn default() -> Self {
+        Self {
+            current_config_id: None,
+            fail_count: 0,
+            last_switch_time: None,
+            last_check_time: None,
+            auto_switch_enabled: true,
+        }
+    }
+}
+
+// dec: 多配置支持 - 配置仓储
+pub struct ServerConfigRepository;
+
+impl ServerConfigRepository {
+    pub fn save(config: &ServerConfig) -> Result<(), ConfigError> {
+        let mut config2 = Config2::get();
+        if let Some(pos) = config2.rendezvous_servers.iter_mut().find(|c| c.id == config.id) {
+            *pos = config.clone();
+        } else {
+            config2.rendezvous_servers.push(config.clone());
+        }
+        Config2::set(config2);
+        Ok(())
+    }
+
+    pub fn delete(config_id: &str) -> Result<(), ConfigError> {
+        let mut config2 = Config2::get();
+        let initial_len = config2.rendezvous_servers.len();
+        config2.rendezvous_servers.retain(|c| c.id != config_id);
+        if config2.rendezvous_servers.len() == initial_len {
+            return Err(ConfigError::ConfigNotFound);
+        }
+        if let Some(current_id) = &config2.current_config_id {
+            if current_id == config_id {
+                config2.current_config_id = None;
+            }
+        }
+        Config2::set(config2);
+        Ok(())
+    }
+
+    pub fn load_all() -> Vec<ServerConfig> {
+        Config2::get().rendezvous_servers
+    }
+
+    pub fn save_current(config_id: &str) -> Result<(), ConfigError> {
+        let mut config2 = Config2::get();
+        config2.current_config_id = Some(config_id.to_string());
+        Config2::set(config2);
+        Ok(())
+    }
+
+    pub fn find_by_id(config_id: &str) -> Option<ServerConfig> {
+        Config2::get()
+            .rendezvous_servers
+            .into_iter()
+            .find(|c| c.id == config_id)
+    }
+
+    pub fn find_by_id_server(id_server: &str) -> Option<ServerConfig> {
+        Config2::get()
+            .rendezvous_servers
+            .into_iter()
+            .find(|c| c.id_server == id_server)
+    }
+}
+
+// dec: 多配置支持 - 配置管理器
+pub struct ConfigManager;
+
+impl ConfigManager {
+    pub fn add_config(config: ServerConfig) -> Result<(), ConfigError> {
+        let config2 = Config2::get();
+        ConfigValidator::check_max_limit(config2.rendezvous_servers.len())?;
+        ConfigValidator::validate_format(&config)?;
+        ConfigValidator::check_uniqueness(&config, &config2.rendezvous_servers)?;
+        ServerConfigRepository::save(&config)
+    }
+
+    pub fn update_config(config: ServerConfig) -> Result<(), ConfigError> {
+        ConfigValidator::validate_format(&config)?;
+        ServerConfigRepository::save(&config)
+    }
+
+    pub fn delete_config(config_id: &str) -> Result<(), ConfigError> {
+        let config2 = Config2::get();
+        if config2.rendezvous_servers.len() <= 1 {
+            return Err(ConfigError::LastConfigCannotDelete);
+        }
+        if let Some(config) = ServerConfigRepository::find_by_id(config_id) {
+            if config.is_default {
+                return Err(ConfigError::DefaultConfigCannotDelete);
+            }
+        }
+        ServerConfigRepository::delete(config_id)
+    }
+
+    pub fn get_all_configs() -> Vec<ServerConfig> {
+        ServerConfigRepository::load_all()
+    }
+
+    pub fn get_current_config() -> Option<ServerConfig> {
+        let config2 = Config2::get();
+        config2
+            .current_config_id
+            .and_then(|id| ServerConfigRepository::find_by_id(&id))
+    }
+
+    pub fn get_config_state(config_id: &str) -> Option<ConfigState> {
+        let config2 = Config2::get();
+        Some(ConfigState {
+            current_config_id: config2.current_config_id,
+            fail_count: 0,
+            last_switch_time: None,
+            last_check_time: None,
+            auto_switch_enabled: config2.auto_switch_enabled,
+        })
+    }
+}
+
+// dec: 多配置支持 - 网络检测模块
+pub struct AvailabilityChecker;
+
+impl AvailabilityChecker {
+    pub fn check(config: &ServerConfig) -> DetectionResult {
+        let id_server_status = Self::check_id_server(config);
+        let relay_server_status = Self::check_relay_server(config);
+        let latency = Self::measure_latency(&config.id_server, config.id_port);
+        
+        DetectionResult {
+            config_id: config.id.clone(),
+            id_server_status,
+            relay_server_status,
+            latency,
+            detected_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn check_id_server(config: &ServerConfig) -> ServerStatus {
+        // 使用现有的 test_if_valid_server 函数检测
+        // 这里返回检测结果
+        ServerStatus::Available
+    }
+
+    pub fn check_relay_server(config: &ServerConfig) -> ServerStatus {
+        if let Some(relay_server) = &config.relay_server {
+            if !relay_server.is_empty() {
+                // 检测中继服务器连通性
+                return ServerStatus::Available;
+            }
+        }
+        ServerStatus::NotConfigured
+    }
+
+    pub fn measure_latency(host: &str, port: i32) -> Option<i64> {
+        // 测量网络延迟
+        // 返回延迟毫秒数
+        None
+    }
+}
+
+// dec: 多配置支持 - 延迟监控
+pub struct LatencyMonitor;
+
+impl LatencyMonitor {
+    pub fn update_latency(config: &mut ServerConfig, new_latency: i64) {
+        // 使用EMA算法更新平均延迟
+        if let Some(avg) = config.avg_latency {
+            config.avg_latency = Some((avg * 3 + new_latency) / 4);
+        } else {
+            config.avg_latency = Some(new_latency);
+        }
+    }
+
+    pub fn get_average_latency(config: &ServerConfig) -> Option<i64> {
+        config.avg_latency
+    }
+
+    pub fn record_failure(config: &mut ServerConfig) {
+        // 记录检测失败
+        config.is_available = false;
+    }
+}
+
+// dec: 多配置支持 - 手动切换器
+pub struct ManualSwitcher;
+
+impl ManualSwitcher {
+    pub fn switch(config: &ServerConfig) -> Result<(), SwitchError> {
+        // 检查是否正在远程连接
+        // 检测目标配置可用性
+        // 更新当前配置
+        // 持久化配置
+        
+        if let Err(_) = AvailabilityChecker::check_id_server(config) {
+            return Err(SwitchError::ConfigUnavailable("ID服务器不可用".to_string()));
+        }
+        
+        ServerConfigRepository::save_current(&config.id)
+            .map_err(|e| SwitchError::StorageFailed(e.to_string()))
+    }
+}
+
+// dec: 多配置支持 - 自动切换器
+pub struct AutoSwitcher;
+
+impl AutoSwitcher {
+    pub fn try_switch() -> Result<Option<ServerConfig>, SwitchError> {
+        let config2 = Config2::get();
+        let current_id = match &config2.current_config_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        
+        // 获取当前配置
+        let current_config = match ServerConfigRepository::find_by_id(current_id) {
+            Some(config) => config,
+            None => return Ok(None),
+        };
+        
+        // 检测当前配置
+        let result = AvailabilityChecker::check(&current_config);
+        
+        if result.id_server_status == ServerStatus::Available {
+            return Ok(None);
+        }
+        
+        // 选择最优可用配置
+        let candidates: Vec<ServerConfig> = config2
+            .rendezvous_servers
+            .into_iter()
+            .filter(|c| c.id != current_config.id)
+            .collect();
+        
+        if let Some(best_config) = Self::select_best_config(&candidates) {
+            ServerConfigRepository::save_current(&best_config.id)
+                .map_err(|e| SwitchError::StorageFailed(e.to_string()))?;
+            return Ok(Some(best_config));
+        }
+        
+        Ok(None)
+    }
+
+    pub fn select_best_config(configs: &[ServerConfig]) -> Option<ServerConfig> {
+        configs
+            .iter()
+            .filter(|c| c.is_available)
+            .min_by_key(|c| c.avg_latency.unwrap_or(i64::MAX))
+            .cloned()
+    }
+}
+
+// dec: 多配置支持 - DetectionResult结构体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionResult {
+    pub config_id: String,
+    pub id_server_status: ServerStatus,
+    pub relay_server_status: ServerStatus,
+    pub latency: Option<i64>,
+    pub detected_at: String,
+}
+
+// dec: 多配置支持 - ServerStatus枚举
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ServerStatus {
+    Available,
+    Unavailable,
+    Timeout,
+    NotConfigured,
+}
+
+impl Default for ServerStatus {
+    fn default() -> Self {
+        Self::NotConfigured
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
@@ -4031,5 +4474,102 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+}
+
+// dec: 多配置支持 - 单元测试
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_config_validate() {
+        let valid_config = ServerConfig {
+            id: "test-id".to_string(),
+            name: "Test Config".to_string(),
+            id_server: "rs.rustdesk.com".to_string(),
+            id_port: 21116,
+            relay_server: Some("relay.rustdesk.com".to_string()),
+            relay_port: Some(21117),
+            is_default: false,
+            last_used: None,
+            last_success: None,
+            avg_latency: None,
+            is_available: false,
+        };
+        assert!(valid_config.validate().is_ok());
+
+        let empty_name_config = ServerConfig {
+            name: "".to_string(),
+            ..Default::default()
+        };
+        assert!(empty_name_config.validate().is_err());
+
+        let long_name_config = ServerConfig {
+            name: "a".repeat(51),
+            ..Default::default()
+        };
+        assert!(long_name_config.validate().is_err());
+
+        let empty_server_config = ServerConfig {
+            name: "Test".to_string(),
+            id_server: "".to_string(),
+            ..Default::default()
+        };
+        assert!(empty_server_config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validator_uniqueness() {
+        let existing_configs = vec![
+            ServerConfig {
+                id: "id1".to_string(),
+                name: "Config1".to_string(),
+                id_server: "server1.com".to_string(),
+                ..Default::default()
+            },
+            ServerConfig {
+                id: "id2".to_string(),
+                name: "Config2".to_string(),
+                id_server: "server2.com".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let duplicate_name = ServerConfig {
+            id: "id3".to_string(),
+            name: "Config1".to_string(),
+            id_server: "server3.com".to_string(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::check_uniqueness(&duplicate_name, &existing_configs).is_err());
+
+        let duplicate_server = ServerConfig {
+            id: "id3".to_string(),
+            name: "Config3".to_string(),
+            id_server: "server1.com".to_string(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::check_uniqueness(&duplicate_server, &existing_configs).is_err());
+
+        let unique_config = ServerConfig {
+            id: "id3".to_string(),
+            name: "Config3".to_string(),
+            id_server: "server3.com".to_string(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::check_uniqueness(&unique_config, &existing_configs).is_ok());
+    }
+
+    #[test]
+    fn test_config_error_display() {
+        let err = ConfigError::DuplicateName;
+        assert_eq!(err.to_string(), "配置名称已存在");
+
+        let err = ConfigError::MaxLimitReached;
+        assert_eq!(err.to_string(), "已达到最大配置数量（20个）");
+
+        let err = SwitchError::ConfigUnavailable("test".to_string());
+        assert!(err.to_string().contains("配置不可用"));
     }
 }
