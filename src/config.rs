@@ -4481,7 +4481,7 @@ mod tests {
 
 // dec: 多配置支持 - 单元测试
 #[cfg(test)]
-mod tests {
+mod tests_multi_config {
     use super::*;
 
     #[test]
