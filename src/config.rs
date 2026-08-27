@@ -441,57 +441,89 @@ impl Default for ConfigState {
     }
 }
 
+// dec: 多配置支持 - 独立存储，避免与 Config2 共享文件被其他进程覆盖或序列化异常导致丢失
+const MULTI_CONFIG_SUFFIX: &str = "multi_config";
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct MultiServerStore {
+    pub rendezvous_servers: Vec<ServerConfig>,
+    pub current_config_id: Option<String>,
+}
+
+impl MultiServerStore {
+    fn file() -> PathBuf {
+        Config::file_(MULTI_CONFIG_SUFFIX)
+    }
+
+    fn load() -> Self {
+        if let Ok(s) = std::fs::read_to_string(Self::file()) {
+            toml::from_str(&s).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) {
+        if let Ok(s) = toml::to_string(self) {
+            if let Some(parent) = Self::file().parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(Self::file(), s);
+        }
+    }
+}
+
 // dec: 多配置支持 - 配置仓储
 pub struct ServerConfigRepository;
 
 impl ServerConfigRepository {
     pub fn save(config: &ServerConfig) -> Result<(), ConfigError> {
-        let mut config2 = Config2::get();
-        if let Some(pos) = config2.rendezvous_servers.iter_mut().find(|c| c.id == config.id) {
+        let mut store = MultiServerStore::load();
+        if let Some(pos) = store.rendezvous_servers.iter_mut().find(|c| c.id == config.id) {
             *pos = config.clone();
         } else {
-            config2.rendezvous_servers.push(config.clone());
+            store.rendezvous_servers.push(config.clone());
         }
-        Config2::set(config2);
+        store.save();
         Ok(())
     }
 
     pub fn delete(config_id: &str) -> Result<(), ConfigError> {
-        let mut config2 = Config2::get();
-        let initial_len = config2.rendezvous_servers.len();
-        config2.rendezvous_servers.retain(|c| c.id != config_id);
-        if config2.rendezvous_servers.len() == initial_len {
+        let mut store = MultiServerStore::load();
+        let initial_len = store.rendezvous_servers.len();
+        store.rendezvous_servers.retain(|c| c.id != config_id);
+        if store.rendezvous_servers.len() == initial_len {
             return Err(ConfigError::ConfigNotFound);
         }
-        if let Some(current_id) = &config2.current_config_id {
+        if let Some(current_id) = &store.current_config_id {
             if current_id == config_id {
-                config2.current_config_id = None;
+                store.current_config_id = None;
             }
         }
-        Config2::set(config2);
+        store.save();
         Ok(())
     }
 
     pub fn load_all() -> Vec<ServerConfig> {
-        Config2::get().rendezvous_servers
+        MultiServerStore::load().rendezvous_servers
     }
 
     pub fn save_current(config_id: &str) -> Result<(), ConfigError> {
-        let mut config2 = Config2::get();
-        config2.current_config_id = Some(config_id.to_string());
-        Config2::set(config2);
+        let mut store = MultiServerStore::load();
+        store.current_config_id = Some(config_id.to_string());
+        store.save();
         Ok(())
     }
 
     pub fn find_by_id(config_id: &str) -> Option<ServerConfig> {
-        Config2::get()
+        MultiServerStore::load()
             .rendezvous_servers
             .into_iter()
             .find(|c| c.id == config_id)
     }
 
     pub fn find_by_id_server(id_server: &str) -> Option<ServerConfig> {
-        Config2::get()
+        MultiServerStore::load()
             .rendezvous_servers
             .into_iter()
             .find(|c| c.id_server == id_server)
@@ -503,10 +535,10 @@ pub struct ConfigManager;
 
 impl ConfigManager {
     pub fn add_config(config: ServerConfig) -> Result<(), ConfigError> {
-        let config2 = Config2::get();
-        ConfigValidator::check_max_limit(config2.rendezvous_servers.len())?;
+        let store = MultiServerStore::load();
+        ConfigValidator::check_max_limit(store.rendezvous_servers.len())?;
         ConfigValidator::validate_format(&config)?;
-        ConfigValidator::check_uniqueness(&config, &config2.rendezvous_servers)?;
+        ConfigValidator::check_uniqueness(&config, &store.rendezvous_servers)?;
         ServerConfigRepository::save(&config)
     }
 
@@ -516,8 +548,8 @@ impl ConfigManager {
     }
 
     pub fn delete_config(config_id: &str) -> Result<(), ConfigError> {
-        let config2 = Config2::get();
-        if config2.rendezvous_servers.len() <= 1 {
+        let store = MultiServerStore::load();
+        if store.rendezvous_servers.len() <= 1 {
             return Err(ConfigError::LastConfigCannotDelete);
         }
         if let Some(config) = ServerConfigRepository::find_by_id(config_id) {
@@ -533,16 +565,17 @@ impl ConfigManager {
     }
 
     pub fn get_current_config() -> Option<ServerConfig> {
-        let config2 = Config2::get();
-        config2
+        let store = MultiServerStore::load();
+        store
             .current_config_id
             .and_then(|id| ServerConfigRepository::find_by_id(&id))
     }
 
     pub fn get_config_state(config_id: &str) -> Option<ConfigState> {
+        let store = MultiServerStore::load();
         let config2 = Config2::get();
         Some(ConfigState {
-            current_config_id: config2.current_config_id,
+            current_config_id: store.current_config_id,
             fail_count: 0,
             last_switch_time: None,
             last_check_time: None,
@@ -653,8 +686,8 @@ pub struct AutoSwitcher;
 
 impl AutoSwitcher {
     pub fn try_switch() -> Result<Option<ServerConfig>, SwitchError> {
-        let config2 = Config2::get();
-        let current_id = match &config2.current_config_id {
+        let store = MultiServerStore::load();
+        let current_id = match &store.current_config_id {
             Some(id) => id,
             None => return Ok(None),
         };
@@ -673,7 +706,7 @@ impl AutoSwitcher {
         }
         
         // 选择最优可用配置
-        let candidates: Vec<ServerConfig> = config2
+        let candidates: Vec<ServerConfig> = store
             .rendezvous_servers
             .into_iter()
             .filter(|c| c.id != current_config.id)
@@ -991,14 +1024,6 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
-        // 常驻的 service 进程不持有多配置数据，但其生命周期内会改写 Config2 文件。
-        // 若本进程内存里没有多配置数据，则保留磁盘上已有的，避免覆盖清空。
-        if config.rendezvous_servers.is_empty() && !stored.rendezvous_servers.is_empty() {
-            config.rendezvous_servers = stored.rendezvous_servers;
-        }
-        if config.current_config_id.is_none() && stored.current_config_id.is_some() {
-            config.current_config_id = stored.current_config_id;
-        }
         Config::store_(&config, "2");
     }
 
