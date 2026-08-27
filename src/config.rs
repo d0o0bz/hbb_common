@@ -991,6 +991,14 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
+        // 常驻的 service 进程不持有多配置数据，但其生命周期内会改写 Config2 文件。
+        // 若本进程内存里没有多配置数据，则保留磁盘上已有的，避免覆盖清空。
+        if config.rendezvous_servers.is_empty() && !stored.rendezvous_servers.is_empty() {
+            config.rendezvous_servers = stored.rendezvous_servers;
+        }
+        if config.current_config_id.is_none() && stored.current_config_id.is_some() {
+            config.current_config_id = stored.current_config_id;
+        }
         Config::store_(&config, "2");
     }
 
