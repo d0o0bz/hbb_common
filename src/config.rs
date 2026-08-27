@@ -570,25 +570,39 @@ impl AvailabilityChecker {
     }
 
     pub fn check_id_server(config: &ServerConfig) -> ServerStatus {
-        // 使用现有的 test_if_valid_server 函数检测
-        // 这里返回检测结果
-        ServerStatus::Available
+        let host = format!("{}:{}", config.id_server, config.id_port);
+        if crate::socket_client::test_if_valid_server(&host, false).is_empty() {
+            ServerStatus::Available
+        } else {
+            ServerStatus::Unavailable
+        }
     }
 
     pub fn check_relay_server(config: &ServerConfig) -> ServerStatus {
         if let Some(relay_server) = &config.relay_server {
             if !relay_server.is_empty() {
-                // 检测中继服务器连通性
-                return ServerStatus::Available;
+                let port = config.relay_port.unwrap_or(RELAY_PORT);
+                let host = format!("{}:{}", relay_server, port);
+                if crate::socket_client::test_if_valid_server(&host, false).is_empty() {
+                    return ServerStatus::Available;
+                }
+                return ServerStatus::Unavailable;
             }
         }
         ServerStatus::NotConfigured
     }
 
-    pub fn measure_latency(_host: &str, _port: i32) -> Option<i64> {
-        // 测量网络延迟
-        // 返回延迟毫秒数
-        None
+    pub fn measure_latency(host: &str, port: i32) -> Option<i64> {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        let start = std::time::Instant::now();
+        match TcpStream::connect_timeout(
+            &addr.parse().ok()?,
+            Duration::from_secs(3),
+        ) {
+            Ok(_) => Some(start.elapsed().as_millis() as i64),
+            Err(_) => None,
+        }
     }
 }
 
