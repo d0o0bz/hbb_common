@@ -244,6 +244,10 @@ pub struct ServerConfig {
     pub id_port: i32,
     pub relay_server: Option<String>,
     pub relay_port: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub is_default: bool,
     pub last_used: Option<String>,
     pub last_success: Option<String>,
@@ -296,6 +300,8 @@ impl Default for ServerConfig {
             id_port: RENDEZVOUS_PORT,
             relay_server: None,
             relay_port: Some(RELAY_PORT),
+            api_server: None,
+            key: None,
             is_default: false,
             last_used: None,
             last_success: None,
