@@ -455,7 +455,7 @@ impl MultiServerStore {
         Config::file_(MULTI_CONFIG_SUFFIX)
     }
 
-    fn load() -> Self {
+    pub fn load() -> Self {
         if let Ok(s) = std::fs::read_to_string(Self::file()) {
             toml::from_str(&s).unwrap_or_default()
         } else {
@@ -463,7 +463,7 @@ impl MultiServerStore {
         }
     }
 
-    fn save(&self) {
+    pub fn save(&self) {
         if let Ok(s) = toml::to_string(self) {
             if let Some(parent) = Self::file().parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -571,7 +571,7 @@ impl ConfigManager {
             .and_then(|id| ServerConfigRepository::find_by_id(&id))
     }
 
-    pub fn get_config_state(config_id: &str) -> Option<ConfigState> {
+    pub fn get_config_state(_config_id: &str) -> Option<ConfigState> {
         let store = MultiServerStore::load();
         let config2 = Config2::get();
         Some(ConfigState {
