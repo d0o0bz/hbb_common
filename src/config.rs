@@ -252,7 +252,6 @@ pub struct ServerConfig {
     pub last_used: Option<String>,
     pub last_success: Option<String>,
     pub avg_latency: Option<i64>,
-    pub is_available: bool,
 }
 
 // dec: 多配置支持 - 扩展Config2结构体
@@ -306,7 +305,6 @@ impl Default for ServerConfig {
             last_used: None,
             last_success: None,
             avg_latency: None,
-            is_available: false,
         }
     }
 }
@@ -564,6 +562,24 @@ impl ConfigManager {
         ServerConfigRepository::load_all()
     }
 
+    pub fn set_default_config(config_id: &str) -> Result<(), ConfigError> {
+        let mut store = MultiServerStore::load();
+        let mut found = false;
+        for c in store.rendezvous_servers.iter_mut() {
+            if c.id == config_id {
+                c.is_default = true;
+                found = true;
+            } else {
+                c.is_default = false;
+            }
+        }
+        if !found {
+            return Err(ConfigError::ConfigNotFound);
+        }
+        store.save();
+        Ok(())
+    }
+
     pub fn get_current_config() -> Option<ServerConfig> {
         let store = MultiServerStore::load();
         store
@@ -655,11 +671,6 @@ impl LatencyMonitor {
     pub fn get_average_latency(config: &ServerConfig) -> Option<i64> {
         config.avg_latency
     }
-
-    pub fn record_failure(config: &mut ServerConfig) {
-        // 记录检测失败
-        config.is_available = false;
-    }
 }
 
 // dec: 多配置支持 - 手动切换器
@@ -724,7 +735,6 @@ impl AutoSwitcher {
     pub fn select_best_config(configs: &[ServerConfig]) -> Option<ServerConfig> {
         configs
             .iter()
-            .filter(|c| c.is_available)
             .min_by_key(|c| c.avg_latency.unwrap_or(i64::MAX))
             .cloned()
     }
@@ -4550,7 +4560,6 @@ mod tests_multi_config {
             last_used: None,
             last_success: None,
             avg_latency: None,
-            is_available: false,
         };
         assert!(valid_config.validate().is_ok());
 
