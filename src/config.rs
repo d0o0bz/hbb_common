@@ -4556,6 +4556,8 @@ mod tests_multi_config {
             id_port: 21116,
             relay_server: Some("relay.rustdesk.com".to_string()),
             relay_port: Some(21117),
+            api_server: None,
+            key: None,
             is_default: false,
             last_used: None,
             last_success: None,
