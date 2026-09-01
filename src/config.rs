@@ -481,7 +481,126 @@ impl MultiServerStore {
 // dec: 多配置支持 - 配置仓储
 pub struct ServerConfigRepository;
 
+/// The options that together answer "which server am I on". They can be edited from the single
+/// server settings, so changing any of them has to reach the store, and the other way round.
+pub const SERVER_OPTION_KEYS: [&str; 4] = [
+    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+    keys::OPTION_RELAY_SERVER,
+    keys::OPTION_API_SERVER,
+    keys::OPTION_KEY,
+];
+
+#[inline]
+pub fn is_server_option_key(key: &str) -> bool {
+    SERVER_OPTION_KEYS.contains(&key)
+}
+
+/// Split `"host:port"` as the options are stored. A missing or unparsable port yields `None`
+/// so callers fall back to the protocol default instead of persisting a bogus value.
+fn split_host_port(value: &str) -> (String, Option<i32>) {
+    let value = value.trim();
+    if value.is_empty() {
+        return (String::new(), None);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => match port.parse::<i32>() {
+            Ok(port) if port > 0 => (host.to_owned(), Some(port)),
+            _ => (value.to_owned(), None),
+        },
+        _ => (value.to_owned(), None),
+    }
+}
+
+#[inline]
+fn non_empty(value: String) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 impl ServerConfigRepository {
+    /// Mirror the options the connection actually uses back into the store.
+    ///
+    /// The single server settings and the config list are edited from different places, so
+    /// without this they drift apart: the connection can be running on a server that is not
+    /// in the list, which leaves the automatic failover with nothing to switch to.
+    ///
+    /// Idempotent: leaves the file alone when the store already agrees with the options.
+    /// Must not be called while `CONFIG2` is locked for writing, it reads the options back.
+    pub fn sync_from_active_options() -> Option<String> {
+        let (id_server, id_port) =
+            split_host_port(&Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER));
+        if id_server.is_empty() {
+            // No custom server configured, so there is nothing to represent in the list.
+            return None;
+        }
+        let id_port = id_port.unwrap_or(RENDEZVOUS_PORT);
+        let (relay_host, relay_port) =
+            split_host_port(&Config::get_option(keys::OPTION_RELAY_SERVER));
+        let relay_server = non_empty(relay_host);
+        let api_server = non_empty(Config::get_option(keys::OPTION_API_SERVER));
+        let key = non_empty(Config::get_option(keys::OPTION_KEY));
+
+        let mut store = MultiServerStore::load();
+        let mut changed = false;
+        let id = match store
+            .rendezvous_servers
+            .iter_mut()
+            .find(|c| c.id_server == id_server)
+        {
+            Some(entry) => {
+                if entry.id_port != id_port {
+                    entry.id_port = id_port;
+                    changed = true;
+                }
+                if entry.relay_server != relay_server {
+                    entry.relay_server = relay_server;
+                    changed = true;
+                }
+                if entry.relay_port != relay_port {
+                    entry.relay_port = relay_port;
+                    changed = true;
+                }
+                if entry.api_server != api_server {
+                    entry.api_server = api_server;
+                    changed = true;
+                }
+                if entry.key != key {
+                    entry.key = key;
+                    changed = true;
+                }
+                entry.id.clone()
+            }
+            None => {
+                let mut config = ServerConfig::default();
+                config.name = id_server.clone();
+                config.id_server = id_server;
+                config.id_port = id_port;
+                config.relay_server = relay_server;
+                config.relay_port = relay_port;
+                config.api_server = api_server;
+                config.key = key;
+                // First entry to exist becomes the default so the list always has one.
+                config.is_default = store.rendezvous_servers.is_empty();
+                let id = config.id.clone();
+                store.rendezvous_servers.push(config);
+                changed = true;
+                id
+            }
+        };
+        if store.current_config_id.as_deref() != Some(id.as_str()) {
+            store.current_config_id = Some(id.clone());
+            changed = true;
+        }
+        if changed {
+            store.save();
+            log::info!("Synced server config {id} from the active server options");
+        }
+        Some(id)
+    }
+
     pub fn save(config: &ServerConfig) -> Result<(), ConfigError> {
         let mut store = MultiServerStore::load();
         if let Some(pos) = store.rendezvous_servers.iter_mut().find(|c| c.id == config.id) {
@@ -553,14 +672,21 @@ impl ServerConfigRepository {
     /// The config in effect. `custom-rendezvous-server` is what the connection uses, so it
     /// wins over the recorded `current_config_id`, which can lag behind when the service
     /// process switches on its own.
+    ///
+    /// Returns `None` when the server in use is known but is not one of the stored configs,
+    /// e.g. the user set it through the single server settings instead of the list. No stored
+    /// config is in effect then, so `candidates()` keeps every one of them available for
+    /// failover instead of excluding an unrelated entry that merely happens to be recorded.
     pub fn current_id() -> Option<String> {
         let store = MultiServerStore::load();
         let in_use = Config::get_option("custom-rendezvous-server");
         let host = in_use.split(':').next().unwrap_or_default();
         if !host.is_empty() {
-            if let Some(config) = store.rendezvous_servers.iter().find(|c| c.id_server == host) {
-                return Some(config.id.clone());
-            }
+            return store
+                .rendezvous_servers
+                .iter()
+                .find(|c| c.id_server == host)
+                .map(|c| c.id.clone());
         }
         store.current_config_id
     }
@@ -1821,12 +1947,25 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
-        let mut config = CONFIG2.write().unwrap();
-        if config.options == v {
-            return;
+        let server_changed = {
+            let config = CONFIG2.read().unwrap();
+            SERVER_OPTION_KEYS
+                .iter()
+                .any(|k| config.options.get(*k) != v.get(*k))
+        };
+        {
+            let mut config = CONFIG2.write().unwrap();
+            if config.options == v {
+                return;
+            }
+            config.options = v;
+            config.store();
         }
-        config.options = v;
-        config.store();
+        // The write guard is released above, so mirroring the server options into the config
+        // list can read them back without deadlocking on the same lock.
+        if server_changed {
+            ServerConfigRepository::sync_from_active_options();
+        }
     }
 
     pub fn get_option(k: &str) -> String {
@@ -1844,22 +1983,31 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        let is_server_key = is_server_option_key(&k);
+        let mut changed = false;
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
                 config.store();
+                changed = true;
             }
-            return;
+        } else {
+            let mut config = CONFIG2.write().unwrap();
+            let v2 = if v.is_empty() { None } else { Some(&v) };
+            if v2 != config.options.get(&k) {
+                if v2.is_none() {
+                    config.options.remove(&k);
+                } else {
+                    config.options.insert(k, v);
+                }
+                config.store();
+                changed = true;
+            }
         }
-        let mut config = CONFIG2.write().unwrap();
-        let v2 = if v.is_empty() { None } else { Some(&v) };
-        if v2 != config.options.get(&k) {
-            if v2.is_none() {
-                config.options.remove(&k);
-            } else {
-                config.options.insert(k, v);
-            }
-            config.store();
+        // Both branches drop their write guard on exit, so the sync below can read the
+        // options back without deadlocking on the same lock.
+        if changed && is_server_key {
+            ServerConfigRepository::sync_from_active_options();
         }
     }
 
