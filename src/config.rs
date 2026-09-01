@@ -463,10 +463,17 @@ impl MultiServerStore {
 
     pub fn save(&self) {
         if let Ok(s) = toml::to_string(self) {
-            if let Some(parent) = Self::file().parent() {
+            let path = Self::file();
+            if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(Self::file(), s);
+            // Rename instead of writing in place: the store is read by both the ui and the
+            // service process, and a half written file makes `load` fall back to an empty
+            // store, silently dropping every config.
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
         }
     }
 }
@@ -511,6 +518,51 @@ impl ServerConfigRepository {
         store.current_config_id = Some(config_id.to_string());
         store.save();
         Ok(())
+    }
+
+    /// Write `config` into the options that the running connection actually reads.
+    /// Without this a recorded `current_config_id` has no effect on the connection.
+    ///
+    /// The setter is injected because the ui process has to push options to the service
+    /// process over ipc, while the service owns the connection and writes them directly.
+    pub fn apply_current(config: &ServerConfig, set_option: &mut impl FnMut(String, String)) {
+        let id_server = if config.id_server.contains(':') {
+            config.id_server.clone()
+        } else {
+            format!("{}:{}", config.id_server, config.id_port)
+        };
+        set_option("custom-rendezvous-server".to_owned(), id_server);
+        // Clear instead of inheriting the previous server's relay.
+        set_option(
+            "relay-server".to_owned(),
+            config.relay_server.clone().unwrap_or_default(),
+        );
+        set_option(
+            "api-server".to_owned(),
+            config.api_server.clone().unwrap_or_default(),
+        );
+        let key = config.key.clone().unwrap_or_default();
+        if key != Config::get_option("key") {
+            set_option("key".to_owned(), key);
+            // A different server public key invalidates the previous pk confirmation,
+            // otherwise the new server is never sent a register_pk.
+            Config::set_key_confirmed(false);
+        }
+    }
+
+    /// The config in effect. `custom-rendezvous-server` is what the connection uses, so it
+    /// wins over the recorded `current_config_id`, which can lag behind when the service
+    /// process switches on its own.
+    pub fn current_id() -> Option<String> {
+        let store = MultiServerStore::load();
+        let in_use = Config::get_option("custom-rendezvous-server");
+        let host = in_use.split(':').next().unwrap_or_default();
+        if !host.is_empty() {
+            if let Some(config) = store.rendezvous_servers.iter().find(|c| c.id_server == host) {
+                return Some(config.id.clone());
+            }
+        }
+        store.current_config_id
     }
 
     pub fn find_by_id(config_id: &str) -> Option<ServerConfig> {
@@ -605,9 +657,12 @@ pub struct AvailabilityChecker;
 
 impl AvailabilityChecker {
     pub fn check(config: &ServerConfig) -> DetectionResult {
-        let id_server_status = Self::check_id_server(config);
-        let relay_server_status = Self::check_relay_server(config);
         let latency = Self::measure_latency(&config.id_server, config.id_port);
+        let id_server_status = match latency {
+            Some(_) => ServerStatus::Available,
+            None => ServerStatus::Unavailable,
+        };
+        let relay_server_status = Self::check_relay_server(config);
         
         DetectionResult {
             config_id: config.id.clone(),
@@ -619,11 +674,11 @@ impl AvailabilityChecker {
     }
 
     pub fn check_id_server(config: &ServerConfig) -> ServerStatus {
-        let host = format!("{}:{}", config.id_server, config.id_port);
-        if crate::socket_client::test_if_valid_server(&host, false).is_empty() {
-            ServerStatus::Available
-        } else {
-            ServerStatus::Unavailable
+        // A real connection attempt, not just name resolution: a server that is down but
+        // still resolvable must be reported as unavailable.
+        match Self::measure_latency(&config.id_server, config.id_port) {
+            Some(_) => ServerStatus::Available,
+            None => ServerStatus::Unavailable,
         }
     }
 
@@ -631,8 +686,7 @@ impl AvailabilityChecker {
         if let Some(relay_server) = &config.relay_server {
             if !relay_server.is_empty() {
                 let port = config.relay_port.unwrap_or(RELAY_PORT);
-                let host = format!("{}:{}", relay_server, port);
-                if crate::socket_client::test_if_valid_server(&host, false).is_empty() {
+                if Self::measure_latency(relay_server, port).is_some() {
                     return ServerStatus::Available;
                 }
                 return ServerStatus::Unavailable;
@@ -693,50 +747,78 @@ impl ManualSwitcher {
 }
 
 // dec: 多配置支持 - 自动切换器
+const PROBE_TIMEOUT_MS: u64 = 3_000;
 pub struct AutoSwitcher;
 
 impl AutoSwitcher {
-    pub fn try_switch() -> Result<Option<ServerConfig>, SwitchError> {
+    /// Every config except the one in use, cheapest first when a latency is recorded.
+    pub fn candidates() -> Vec<ServerConfig> {
         let store = MultiServerStore::load();
-        let current_id = match &store.current_config_id {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-        
-        // 获取当前配置
-        let current_config = match ServerConfigRepository::find_by_id(current_id) {
-            Some(config) => config,
-            None => return Ok(None),
-        };
-        
-        // 检测当前配置
-        let result = AvailabilityChecker::check(&current_config);
-        
-        if result.id_server_status == ServerStatus::Available {
-            return Ok(None);
-        }
-        
-        // 选择最优可用配置
-        let candidates: Vec<ServerConfig> = store
+        let current_id = ServerConfigRepository::current_id();
+        let mut candidates: Vec<ServerConfig> = store
             .rendezvous_servers
             .into_iter()
-            .filter(|c| c.id != current_config.id)
+            .filter(|c| Some(&c.id) != current_id.as_ref())
             .collect();
-        
-        if let Some(best_config) = Self::select_best_config(&candidates) {
-            ServerConfigRepository::save_current(&best_config.id)
-                .map_err(|e| SwitchError::StorageFailed(e.to_string()))?;
-            return Ok(Some(best_config));
-        }
-        
-        Ok(None)
+        candidates.sort_by_key(|c| c.avg_latency.unwrap_or(i64::MAX));
+        candidates
     }
 
-    pub fn select_best_config(configs: &[ServerConfig]) -> Option<ServerConfig> {
-        configs
-            .iter()
-            .min_by_key(|c| c.avg_latency.unwrap_or(i64::MAX))
-            .cloned()
+    /// Probe the other configs and switch to the fastest reachable one.
+    ///
+    /// Callers must have established that the current server is down: a reachable server is
+    /// never a reason to tear down working connections.
+    pub async fn try_switch() -> Result<Option<ServerConfig>, SwitchError> {
+        let candidates = Self::candidates();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let mut futs = Vec::new();
+        for config in candidates {
+            futs.push(async move {
+                let latency = Self::probe(&config).await;
+                (config, latency)
+            });
+        }
+        let mut best: Option<(ServerConfig, i64)> = None;
+        for (config, latency) in crate::futures::future::join_all(futs).await {
+            if let Some(latency) = latency {
+                if best.as_ref().map(|b| latency < b.1).unwrap_or(true) {
+                    best = Some((config, latency));
+                }
+            }
+        }
+        match best {
+            Some((config, latency)) => {
+                log::info!(
+                    "Switching to server config {} ({}), latency {}ms",
+                    config.name,
+                    config.id_server,
+                    latency / 1000
+                );
+                ServerConfigRepository::apply_current(&config, &mut |k, v| {
+                    Config::set_option(k, v);
+                });
+                ServerConfigRepository::save_current(&config.id)
+                    .map_err(|e| SwitchError::StorageFailed(e.to_string()))?;
+                Ok(Some(config))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Probe without going through `Config::update_latency`: that map drives the connection
+    /// status shown in the ui, so a mere probe must not be able to move it.
+    async fn probe(config: &ServerConfig) -> Option<i64> {
+        let host = format!("{}:{}", config.id_server, config.id_port);
+        let tm = std::time::Instant::now();
+        match crate::socket_client::connect_tcp(host, PROBE_TIMEOUT_MS).await {
+            Ok(_) => Some(tm.elapsed().as_micros() as i64),
+            Err(err) => {
+                log::debug!("Server config {} is unreachable: {err}", config.name);
+                None
+            }
+        }
     }
 }
 
