@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, RwLock,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -374,8 +377,9 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Reject another config once the store already holds [`MAX_SERVER_CONFIGS`] entries.
     pub fn check_max_limit(count: usize) -> Result<(), ConfigError> {
-        if count >= 20 {
+        if count >= MAX_SERVER_CONFIGS {
             return Err(ConfigError::MaxLimitReached);
         }
         Ok(())
@@ -389,12 +393,17 @@ pub enum ConfigError {
     DuplicateName,
     #[error("该ID服务器配置已存在")]
     DuplicateServer,
-    #[error("已达到最大配置数量（20个）")]
+    // Keep the number in sync with MAX_SERVER_CONFIGS.
+    #[error("已达到最大配置数量（5个）")]
     MaxLimitReached,
     #[error("不能删除最后一个配置")]
     LastConfigCannotDelete,
     #[error("默认配置不允许删除")]
     DefaultConfigCannotDelete,
+    #[error("默认配置固定置顶，不可调整优先级")]
+    DefaultConfigCannotMove,
+    #[error("优先级位置无效")]
+    InvalidPriority,
     #[error("配置格式错误: {0}")]
     InvalidFormat(String),
     #[error("配置不存在")]
@@ -442,6 +451,9 @@ impl Default for ConfigState {
 // dec: 多配置支持 - 独立存储，避免与 Config2 共享文件被其他进程覆盖或序列化异常导致丢失
 const MULTI_CONFIG_SUFFIX: &str = "multi_config";
 
+/// 多服务器配置数量上限。
+pub const MAX_SERVER_CONFIGS: usize = 5;
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct MultiServerStore {
     pub rendezvous_servers: Vec<ServerConfig>,
@@ -476,6 +488,17 @@ impl MultiServerStore {
             }
         }
     }
+
+    /// Load the store for reading, capped at [`MAX_SERVER_CONFIGS`] entries.
+    ///
+    /// Only for the paths that show the list to the user or pick a failover candidate. Write
+    /// paths must keep using [`Self::load`], which returns everything on disk: loading a
+    /// truncated store and saving it back would drop the entries past the cap for good.
+    pub fn load_capped() -> Self {
+        let mut store = Self::load();
+        store.rendezvous_servers.truncate(MAX_SERVER_CONFIGS);
+        store
+    }
 }
 
 // dec: 多配置支持 - 配置仓储
@@ -493,6 +516,38 @@ pub const SERVER_OPTION_KEYS: [&str; 4] = [
 #[inline]
 pub fn is_server_option_key(key: &str) -> bool {
     SERVER_OPTION_KEYS.contains(&key)
+}
+
+/// Set while `apply_current` writes the server options.
+///
+/// `apply_current` writes four options and every write triggers the sync hook, so without this
+/// guard switching to another config would also promote it to default and move it to the top,
+/// throwing away the priority order the user arranged. Switching, and editing the config in
+/// use, must only change what is in use.
+static SUPPRESS_DEFAULT_PROMOTION: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`SUPPRESS_DEFAULT_PROMOTION`] for the duration of a scope, so the flag is cleared
+/// even when the caller returns early.
+pub(crate) struct SuppressDefaultPromotion;
+
+impl SuppressDefaultPromotion {
+    /// Only a direct edit of the single server settings re-derives the default, a switch does
+    /// not.
+    pub fn enter() -> Self {
+        SUPPRESS_DEFAULT_PROMOTION.store(true, Ordering::SeqCst);
+        Self
+    }
+
+    /// Whether re-deriving the default is currently suppressed.
+    pub fn is_suppressed() -> bool {
+        SUPPRESS_DEFAULT_PROMOTION.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SuppressDefaultPromotion {
+    fn drop(&mut self) {
+        SUPPRESS_DEFAULT_PROMOTION.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Split `"host:port"` as the options are stored. A missing or unparsable port yields `None`
@@ -574,6 +629,16 @@ impl ServerConfigRepository {
                 entry.id.clone()
             }
             None => {
+                if store.rendezvous_servers.len() >= MAX_SERVER_CONFIGS {
+                    // Never drop a stored config to make room. The list is full, so this server
+                    // stays out of it until the user removes another one; anything already
+                    // stored is kept on disk either way.
+                    log::warn!(
+                        "Server {id_server} is not in the config list and the list already holds \
+                         {MAX_SERVER_CONFIGS} entries, leaving it out"
+                    );
+                    return None;
+                }
                 let mut config = ServerConfig::default();
                 config.name = id_server.clone();
                 config.id_server = id_server;
@@ -594,11 +659,43 @@ impl ServerConfigRepository {
             store.current_config_id = Some(id.clone());
             changed = true;
         }
+        // A switch, or an edit of the config in use, must not disturb which config is the
+        // default nor the priority order. Only a direct edit of the single server settings
+        // re-derives the default, which is what makes the upstream setting authoritative.
+        if !SuppressDefaultPromotion::is_suppressed() {
+            changed |= Self::promote_default(&mut store, &id);
+        }
         if changed {
             store.save();
             log::info!("Synced server config {id} from the active server options");
         }
         Some(id)
+    }
+
+    /// Make `config_id` the only default and move it to the front, the highest priority
+    /// position. Returns whether the store changed.
+    fn promote_default(store: &mut MultiServerStore, config_id: &str) -> bool {
+        let mut changed = false;
+        for c in store.rendezvous_servers.iter_mut() {
+            let is_default = c.id == config_id;
+            if c.is_default != is_default {
+                c.is_default = is_default;
+                changed = true;
+            }
+        }
+        let Some(pos) = store
+            .rendezvous_servers
+            .iter()
+            .position(|c| c.id == config_id)
+        else {
+            return changed;
+        };
+        if pos != 0 {
+            let config = store.rendezvous_servers.remove(pos);
+            store.rendezvous_servers.insert(0, config);
+            changed = true;
+        }
+        changed
     }
 
     pub fn save(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -628,8 +725,12 @@ impl ServerConfigRepository {
         Ok(())
     }
 
+    /// The list shown to the user, capped at [`MAX_SERVER_CONFIGS`].
+    ///
+    /// Anything stored past the cap stays on disk and is simply not presented, so raising the
+    /// cap later does not have to recover data.
     pub fn load_all() -> Vec<ServerConfig> {
-        MultiServerStore::load().rendezvous_servers
+        MultiServerStore::load_capped().rendezvous_servers
     }
 
     pub fn save_current(config_id: &str) -> Result<(), ConfigError> {
@@ -645,6 +746,11 @@ impl ServerConfigRepository {
     /// The setter is injected because the ui process has to push options to the service
     /// process over ipc, while the service owns the connection and writes them directly.
     pub fn apply_current(config: &ServerConfig, set_option: &mut impl FnMut(String, String)) {
+        // Every option write below fires the sync hook. Suppress re-deriving the default so
+        // that switching, or editing the config in use, only changes what is in use and leaves
+        // the default and the priority order alone. Held until the end of the function.
+        let _suppress_default = SuppressDefaultPromotion::enter();
+
         let id_server = if config.id_server.contains(':') {
             config.id_server.clone()
         } else {
@@ -754,6 +860,36 @@ impl ConfigManager {
         if !found {
             return Err(ConfigError::ConfigNotFound);
         }
+        store.save();
+        Ok(())
+    }
+
+    /// Move a config to `new_index`, which is its priority, 0 being the highest.
+    ///
+    /// Index 0 belongs to the default config and the default itself cannot be moved: it stays
+    /// pinned to the top so that a failover always tries it first. Out of range indices are
+    /// rejected rather than clamped, so the ui cannot silently drop a move.
+    pub fn move_config(config_id: &str, new_index: usize) -> Result<(), ConfigError> {
+        let mut store = MultiServerStore::load();
+        let len = store.rendezvous_servers.len();
+        let Some(old_index) = store
+            .rendezvous_servers
+            .iter()
+            .position(|c| c.id == config_id)
+        else {
+            return Err(ConfigError::ConfigNotFound);
+        };
+        if store.rendezvous_servers[old_index].is_default {
+            return Err(ConfigError::DefaultConfigCannotMove);
+        }
+        if new_index == 0 || new_index >= len {
+            return Err(ConfigError::InvalidPriority);
+        }
+        if old_index == new_index {
+            return Ok(());
+        }
+        let config = store.rendezvous_servers.remove(old_index);
+        store.rendezvous_servers.insert(new_index, config);
         store.save();
         Ok(())
     }
@@ -877,20 +1013,25 @@ const PROBE_TIMEOUT_MS: u64 = 3_000;
 pub struct AutoSwitcher;
 
 impl AutoSwitcher {
-    /// Every config except the one in use, cheapest first when a latency is recorded.
+    /// The configs to try on failover, highest priority first.
+    ///
+    /// The default config leads because it is the upstream single server setting, then the
+    /// rest follow the order the user arranged. The config in use is deliberately not
+    /// excluded: it can be the highest priority one when the user switched to it by hand, and
+    /// probing it again costs nothing.
     pub fn candidates() -> Vec<ServerConfig> {
-        let store = MultiServerStore::load();
-        let current_id = ServerConfigRepository::current_id();
-        let mut candidates: Vec<ServerConfig> = store
-            .rendezvous_servers
-            .into_iter()
-            .filter(|c| Some(&c.id) != current_id.as_ref())
-            .collect();
-        candidates.sort_by_key(|c| c.avg_latency.unwrap_or(i64::MAX));
+        let mut candidates = MultiServerStore::load_capped().rendezvous_servers;
+        // The default is kept at index 0 by the sync, but do not rely on it.
+        if let Some(pos) = candidates.iter().position(|c| c.is_default) {
+            if pos != 0 {
+                let config = candidates.remove(pos);
+                candidates.insert(0, config);
+            }
+        }
         candidates
     }
 
-    /// Probe the other configs and switch to the fastest reachable one.
+    /// Probe the configs in priority order and switch to the highest priority reachable one.
     ///
     /// Callers must have established that the current server is down: a reachable server is
     /// never a reason to tear down working connections.
@@ -900,22 +1041,35 @@ impl AutoSwitcher {
             return Ok(None);
         }
         let mut futs = Vec::new();
-        for config in candidates {
+        for (index, config) in candidates.into_iter().enumerate() {
             futs.push(async move {
                 let latency = Self::probe(&config).await;
-                (config, latency)
+                (index, config, latency)
             });
         }
-        let mut best: Option<(ServerConfig, i64)> = None;
-        for (config, latency) in crate::futures::future::join_all(futs).await {
+        let mut best: Option<(usize, ServerConfig, i64)> = None;
+        for (index, config, latency) in crate::futures::future::join_all(futs).await {
             if let Some(latency) = latency {
-                if best.as_ref().map(|b| latency < b.1).unwrap_or(true) {
-                    best = Some((config, latency));
+                // Priority decides, not latency: keep the reachable config with the lowest
+                // index, which is the default first and then the user's own order.
+                if best.as_ref().map(|b| index < b.0).unwrap_or(true) {
+                    best = Some((index, config, latency));
                 }
             }
         }
         match best {
-            Some((config, latency)) => {
+            Some((_, config, latency)) => {
+                // Nothing to gain from tearing down and redialling the very server already in
+                // use, so report it instead of restarting the connection.
+                if Some(&config.id) == ServerConfigRepository::current_id().as_ref() {
+                    log::info!(
+                        "Server config {} ({}) is already the highest priority reachable one, \
+                         staying on it",
+                        config.name,
+                        config.id_server
+                    );
+                    return Ok(None);
+                }
                 log::info!(
                     "Switching to server config {} ({}), latency {}ms",
                     config.name,
@@ -4863,7 +5017,7 @@ mod tests_multi_config {
         assert_eq!(err.to_string(), "配置名称已存在");
 
         let err = ConfigError::MaxLimitReached;
-        assert_eq!(err.to_string(), "已达到最大配置数量（20个）");
+        assert_eq!(err.to_string(), "已达到最大配置数量（5个）");
 
         let err = SwitchError::ConfigUnavailable("test".to_string());
         assert!(err.to_string().contains("配置不可用"));
