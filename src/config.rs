@@ -280,17 +280,23 @@ pub struct Config2 {
     // dec: 多配置支持 - 当前配置ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_config_id: Option<String>,
-    // dec: 多配置支持 - 自动切换开关
-    #[serde(default = "default_auto_switch")]
-    pub auto_switch_enabled: bool,
 
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub options: HashMap<String, String>,
 }
 
-fn default_auto_switch() -> bool {
-    true
+// dec: 多配置支持 - 自动切换开关。存在 Config options 而非 Config2 字段：Config2 没有跨进程
+// 同步通道（sync_and_watch_config_dir 仅 macOS/Linux），Windows 服务进程将永远读到启动时的
+// 初始值；走 options 可经 set_option → ipc::set_options 传播到服务进程并落盘，重启后仍生效。
+// 缺省为开启：option2bool 对非 enable-/allow- 前缀的 key 判 value != "N"。
+pub const OPTION_AUTO_SWITCH_ENABLED: &str = "auto-switch-enabled";
+
+pub fn auto_switch_enabled() -> bool {
+    option2bool(
+        OPTION_AUTO_SWITCH_ENABLED,
+        &Config::get_option(OPTION_AUTO_SWITCH_ENABLED),
+    )
 }
 
 impl Default for ServerConfig {
@@ -903,13 +909,12 @@ impl ConfigManager {
 
     pub fn get_config_state(_config_id: &str) -> Option<ConfigState> {
         let store = MultiServerStore::load();
-        let config2 = Config2::get();
         Some(ConfigState {
             current_config_id: store.current_config_id,
             fail_count: 0,
             last_switch_time: None,
             last_check_time: None,
-            auto_switch_enabled: config2.auto_switch_enabled,
+            auto_switch_enabled: auto_switch_enabled(),
         })
     }
 }
@@ -1013,12 +1018,10 @@ const PROBE_TIMEOUT_MS: u64 = 3_000;
 pub struct AutoSwitcher;
 
 impl AutoSwitcher {
-    /// The configs to try on failover, highest priority first.
+    /// The configs in failover priority order, highest first.
     ///
     /// The default config leads because it is the upstream single server setting, then the
-    /// rest follow the order the user arranged. The config in use is deliberately not
-    /// excluded: it can be the highest priority one when the user switched to it by hand, and
-    /// probing it again costs nothing.
+    /// rest follow the order the user arranged.
     pub fn candidates() -> Vec<ServerConfig> {
         let mut candidates = MultiServerStore::load_capped().rendezvous_servers;
         // The default is kept at index 0 by the sync, but do not rely on it.
@@ -1031,15 +1034,70 @@ impl AutoSwitcher {
         candidates
     }
 
-    /// Probe the configs in priority order and switch to the highest priority reachable one.
-    ///
-    /// Callers must have established that the current server is down: a reachable server is
-    /// never a reason to tear down working connections.
+    /// Failover. The caller has established that the server in use is down, so the config
+    /// in use is excluded: a host that still accepts TCP connections while its rendezvous
+    /// service is dead would otherwise win the probe and lock the failover out forever.
+    /// Switches to the highest priority reachable remaining config.
     pub async fn try_switch() -> Result<Option<ServerConfig>, SwitchError> {
+        let current_id = ServerConfigRepository::current_id();
+        let candidates: Vec<ServerConfig> = Self::candidates()
+            .into_iter()
+            .filter(|c| Some(&c.id) != current_id.as_ref())
+            .collect();
+        match Self::probe_lowest_index(candidates).await {
+            Some((_, config, latency)) => {
+                log::info!(
+                    "Switching to server config {} ({}), latency {}ms",
+                    config.name,
+                    config.id_server,
+                    latency / 1000
+                );
+                Self::apply(&config)?;
+                Ok(Some(config))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Preemption. The server in use is healthy; probe only the configs ranking strictly
+    /// higher than it and report the highest priority reachable one without touching any
+    /// state, so the caller decides whether switching back is worth the reconnect.
+    /// Returns None when the config in use is unknown or already the highest priority one.
+    pub async fn find_higher_priority() -> Result<Option<ServerConfig>, SwitchError> {
+        let current_id = ServerConfigRepository::current_id();
         let candidates = Self::candidates();
-        if candidates.is_empty() {
+        let current_index = match candidates
+            .iter()
+            .position(|c| Some(&c.id) == current_id.as_ref())
+        {
+            Some(index) => index,
+            // The config in use is not in the list, so there is no higher rank to go back to.
+            None => return Ok(None),
+        };
+        if current_index == 0 {
             return Ok(None);
         }
+        Ok(Self::probe_lowest_index(
+            candidates.into_iter().take(current_index).collect(),
+        )
+        .await
+        .map(|(_, config, _)| config))
+    }
+
+    /// Persist and activate a switch. Shared by failover and preemption.
+    pub fn apply(config: &ServerConfig) -> Result<(), SwitchError> {
+        ServerConfigRepository::apply_current(config, &mut |k, v| {
+            Config::set_option(k, v);
+        });
+        ServerConfigRepository::save_current(&config.id)
+            .map_err(|e| SwitchError::StorageFailed(e.to_string()))
+    }
+
+    /// Probe the configs in parallel and report the reachable one with the lowest index,
+    /// i.e. the highest priority one. Priority decides, not latency.
+    async fn probe_lowest_index(
+        candidates: Vec<ServerConfig>,
+    ) -> Option<(usize, ServerConfig, i64)> {
         let mut futs = Vec::new();
         for (index, config) in candidates.into_iter().enumerate() {
             futs.push(async move {
@@ -1050,41 +1108,12 @@ impl AutoSwitcher {
         let mut best: Option<(usize, ServerConfig, i64)> = None;
         for (index, config, latency) in crate::futures::future::join_all(futs).await {
             if let Some(latency) = latency {
-                // Priority decides, not latency: keep the reachable config with the lowest
-                // index, which is the default first and then the user's own order.
                 if best.as_ref().map(|b| index < b.0).unwrap_or(true) {
                     best = Some((index, config, latency));
                 }
             }
         }
-        match best {
-            Some((_, config, latency)) => {
-                // Nothing to gain from tearing down and redialling the very server already in
-                // use, so report it instead of restarting the connection.
-                if Some(&config.id) == ServerConfigRepository::current_id().as_ref() {
-                    log::info!(
-                        "Server config {} ({}) is already the highest priority reachable one, \
-                         staying on it",
-                        config.name,
-                        config.id_server
-                    );
-                    return Ok(None);
-                }
-                log::info!(
-                    "Switching to server config {} ({}), latency {}ms",
-                    config.name,
-                    config.id_server,
-                    latency / 1000
-                );
-                ServerConfigRepository::apply_current(&config, &mut |k, v| {
-                    Config::set_option(k, v);
-                });
-                ServerConfigRepository::save_current(&config.id)
-                    .map_err(|e| SwitchError::StorageFailed(e.to_string()))?;
-                Ok(Some(config))
-            }
-            None => Ok(None),
-        }
+        best
     }
 
     /// Probe without going through `Config::update_latency`: that map drives the connection
