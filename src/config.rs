@@ -540,6 +540,18 @@ impl MultiServerStore {
                 let _ = std::fs::rename(&tmp, path);
             }
         }
+        // Keep the shared copy in step, so that `load`, which prefers it, hands back what was
+        // just saved. Without this an edit is silently reverted: the write lands in the file,
+        // the next read comes from the still stale option, and republishing that option puts
+        // the old list back.
+        //
+        // Only once the option already exists. Publishing while it is still empty would put
+        // this process' own legacy file into it, and for the service process that file holds
+        // nothing but the single entry derived from the server options, which would shadow the
+        // list the ui keeps.
+        if !Config::get_option(OPTION_MULTI_SERVER_STORE).is_empty() {
+            self.publish();
+        }
     }
 
     /// Load the store for reading, capped at [`MAX_SERVER_CONFIGS`] entries.
