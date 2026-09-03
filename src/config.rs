@@ -475,7 +475,27 @@ pub struct MultiServerStore {
     pub current_config_id: Option<String>,
 }
 
+/// Whether this process may publish the store into the shared option.
+///
+/// Only the process that owns the list the user edits is allowed to. The service keeps its own
+/// copy of the file, and that copy holds nothing but the single entry it derives from the server
+/// options, so publishing it would shadow the ui's list with that one entry and leave the
+/// failover with nothing to switch to.
+static PUBLISH_ALLOWED: AtomicBool = AtomicBool::new(false);
+
 impl MultiServerStore {
+    /// Mark this process as the owner of the config list, the only one allowed to publish it.
+    ///
+    /// Called once by the ui process at startup. The service must not call it, see
+    /// [`PUBLISH_ALLOWED`].
+    pub fn allow_publish() {
+        PUBLISH_ALLOWED.store(true, Ordering::SeqCst);
+    }
+
+    fn can_publish() -> bool {
+        PUBLISH_ALLOWED.load(Ordering::SeqCst)
+    }
+
     fn file() -> PathBuf {
         Config::file_(MULTI_CONFIG_SUFFIX)
     }
@@ -526,6 +546,20 @@ impl MultiServerStore {
         }
     }
 
+    /// Publish the copy this process keeps on disk, when it owns the list.
+    ///
+    /// Reads the file rather than [`Self::load`], which prefers the shared option and would hand
+    /// back whatever list was last published instead of what was just written. For a caller that
+    /// has produced the authoritative list and has to get it across to the service even while the
+    /// option is still empty, the case [`Self::save`] deliberately leaves alone.
+    pub fn publish_from_file_if_owner() -> Option<String> {
+        let store = Self::load_file();
+        if Self::can_publish() {
+            return store.publish();
+        }
+        None
+    }
+
     pub fn save(&self) {
         if let Ok(s) = toml::to_string(self) {
             let path = Self::file();
@@ -549,7 +583,12 @@ impl MultiServerStore {
         // this process' own legacy file into it, and for the service process that file holds
         // nothing but the single entry derived from the server options, which would shadow the
         // list the ui keeps.
-        if !Config::get_option(OPTION_MULTI_SERVER_STORE).is_empty() {
+        //
+        // And only from the process that owns the list. The service reaches `save` through the
+        // sync hook carrying a store rebuilt from the server options alone, so without this gate
+        // it overwrites the published list with that single entry and, `load` preferring the
+        // option, the ui keeps showing it however many configs the file actually holds.
+        if !Config::get_option(OPTION_MULTI_SERVER_STORE).is_empty() && Self::can_publish() {
             self.publish();
         }
     }
@@ -5018,6 +5057,22 @@ mod tests {
 #[cfg(test)]
 mod tests_multi_config {
     use super::*;
+
+    #[test]
+    fn test_publish_denied_until_the_process_claims_the_list() {
+        // The service reaches `save` through the sync hook carrying a store rebuilt from the
+        // server options alone, so the permission has to start out denied: publishing that
+        // would shadow the list the ui keeps with a single entry, and `load` prefers the
+        // option, so the ui would keep showing it however many configs the file actually
+        // holds. Only the ui process and a deliberate import run call `allow_publish`.
+        assert!(
+            !MultiServerStore::can_publish(),
+            "publishing must stay off unless this process owns the config list"
+        );
+        // Reading the file and publishing are separate concerns, so a process without the
+        // permission must not push anything even when asked to publish explicitly.
+        assert!(MultiServerStore::publish_from_file_if_owner().is_none());
+    }
 
     #[test]
     fn test_server_config_validate() {
