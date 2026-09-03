@@ -457,6 +457,15 @@ impl Default for ConfigState {
 // dec: 多配置支持 - 独立存储，避免与 Config2 共享文件被其他进程覆盖或序列化异常导致丢失
 const MULTI_CONFIG_SUFFIX: &str = "multi_config";
 
+/// The copy of the config list shared between the ui and the service process.
+///
+/// The file alone cannot carry it: it lives in each process' own config dir, so on Windows the
+/// service process, which owns the connection and is the one making the failover decision,
+/// never sees the list the ui process wrote and ends up with nothing to fail over to. Options
+/// do cross that boundary through `set_option` -> `ipc::set_options`, which is the same channel
+/// [`OPTION_AUTO_SWITCH_ENABLED`] and a manual switch already rely on.
+pub const OPTION_MULTI_SERVER_STORE: &str = "multi-server-configs";
+
 /// 多服务器配置数量上限。
 pub const MAX_SERVER_CONFIGS: usize = 5;
 
@@ -471,11 +480,49 @@ impl MultiServerStore {
         Config::file_(MULTI_CONFIG_SUFFIX)
     }
 
-    pub fn load() -> Self {
+    fn load_file() -> Self {
         if let Ok(s) = std::fs::read_to_string(Self::file()) {
             toml::from_str(&s).unwrap_or_default()
         } else {
             Self::default()
+        }
+    }
+
+    /// The list in effect, the shared option when it has been published and the file otherwise.
+    ///
+    /// Every read goes through here, so once the ui has published once both processes agree,
+    /// and before that each one keeps reading its own file exactly as it always did.
+    pub fn load() -> Self {
+        let raw = Config::get_option(OPTION_MULTI_SERVER_STORE);
+        if !raw.is_empty() {
+            match serde_json::from_str::<Self>(&raw) {
+                Ok(store) => return store,
+                Err(err) => log::error!(
+                    "Failed to parse the {OPTION_MULTI_SERVER_STORE} option, \
+                     falling back to the config file: {err}"
+                ),
+            }
+        }
+        Self::load_file()
+    }
+
+    /// Publish into the shared option and hand the serialized form to the caller.
+    ///
+    /// Only the ui process is meant to call it. It owns the list the user edits; letting the
+    /// service publish its own copy would shadow that list with the single entry the service
+    /// derives from the server options, which is exactly the entry the failover has to look
+    /// beyond. The caller is responsible for pushing the returned value over ipc, which
+    /// [`Config::set_option`] cannot do from here.
+    pub fn publish(&self) -> Option<String> {
+        match serde_json::to_string(self) {
+            Ok(json) => {
+                Config::set_option(OPTION_MULTI_SERVER_STORE.to_owned(), json.clone());
+                Some(json)
+            }
+            Err(err) => {
+                log::error!("Failed to serialize the server configs: {err}");
+                None
+            }
         }
     }
 
@@ -534,7 +581,7 @@ static SUPPRESS_DEFAULT_PROMOTION: AtomicBool = AtomicBool::new(false);
 
 /// Holds [`SUPPRESS_DEFAULT_PROMOTION`] for the duration of a scope, so the flag is cleared
 /// even when the caller returns early.
-pub(crate) struct SuppressDefaultPromotion;
+pub struct SuppressDefaultPromotion;
 
 impl SuppressDefaultPromotion {
     /// Only a direct edit of the single server settings re-derives the default, a switch does
