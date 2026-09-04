@@ -511,19 +511,59 @@ impl MultiServerStore {
     /// The list in effect, the shared option when it has been published and the file otherwise.
     ///
     /// Every read goes through here, so once the ui has published once both processes agree,
-    /// and before that each one keeps reading its own file exactly as it always did.
+    /// and before that each one keeps reading its own file exactly as it always did. A published
+    /// list that turns out to belong to another store is set aside, see
+    /// [`Self::prefer_file_over_foreign_option`].
     pub fn load() -> Self {
         let raw = Config::get_option(OPTION_MULTI_SERVER_STORE);
-        if !raw.is_empty() {
-            match serde_json::from_str::<Self>(&raw) {
-                Ok(store) => return store,
-                Err(err) => log::error!(
+        if raw.is_empty() {
+            return Self::load_file();
+        }
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(store) => Self::prefer_file_over_foreign_option(store),
+            Err(err) => {
+                log::error!(
                     "Failed to parse the {OPTION_MULTI_SERVER_STORE} option, \
                      falling back to the config file: {err}"
-                ),
+                );
+                Self::load_file()
             }
         }
-        Self::load_file()
+    }
+
+    /// Put the file back in front when the published option belongs to another store.
+    ///
+    /// The service publishes the single entry it derives from the server options, and that copy
+    /// can reach this process inside an option map coming back over ipc. Sharing one id means
+    /// the two are the same list caught at different times, which is what every write path here
+    /// produces; sharing none means the option came from elsewhere, and left in place it hides
+    /// the configs on disk for good, because the sync then finds the server it knows about in
+    /// the option and never rewrites the file.
+    ///
+    /// Only the owner may do this. The service keeps no list of its own and the option is the
+    /// only way it ever learns one, so for it the option stays authoritative.
+    fn prefer_file_over_foreign_option(store: Self) -> Self {
+        if !Self::can_publish() {
+            return store;
+        }
+        let file = Self::load_file();
+        if file.rendezvous_servers.is_empty() {
+            return store;
+        }
+        let shares_an_id = file
+            .rendezvous_servers
+            .iter()
+            .any(|c| store.rendezvous_servers.iter().any(|s| s.id == c.id));
+        if shares_an_id {
+            return store;
+        }
+        log::warn!(
+            "The {OPTION_MULTI_SERVER_STORE} option holds {} config(s), none of them among the \
+             {} in the config file, using the file",
+            store.rendezvous_servers.len(),
+            file.rendezvous_servers.len()
+        );
+        file
     }
 
     /// Publish into the shared option and hand the serialized form to the caller.
@@ -533,7 +573,13 @@ impl MultiServerStore {
     /// derives from the server options, which is exactly the entry the failover has to look
     /// beyond. The caller is responsible for pushing the returned value over ipc, which
     /// [`Config::set_option`] cannot do from here.
+    ///
+    /// Returns `None` when there is nothing to publish: handing over no entries would wipe the
+    /// copy the peer keeps, which for the service is the only way it learns any config at all.
     pub fn publish(&self) -> Option<String> {
+        if self.rendezvous_servers.is_empty() {
+            return None;
+        }
         match serde_json::to_string(self) {
             Ok(json) => {
                 Config::set_option(OPTION_MULTI_SERVER_STORE.to_owned(), json.clone());
