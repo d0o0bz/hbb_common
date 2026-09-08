@@ -607,19 +607,29 @@ impl MultiServerStore {
     }
 
     pub fn save(&self) {
-        if let Ok(s) = toml::to_string(self) {
-            let path = Self::file();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Rename instead of writing in place: the store is read by both the ui and the
-            // service process, and a half written file makes `load` fall back to an empty
-            // store, silently dropping every config.
-            let tmp = path.with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+        if let Err(err) = self.try_save() {
+            log::error!("Failed to save the server configs: {err}");
         }
+    }
+
+    /// Write the store to disk, reporting whether it got there.
+    ///
+    /// [`Self::save`] cannot answer that, and a caller going on to publish what it has just
+    /// written would otherwise hand every other process the stale copy the failure left
+    /// behind, which then looks like the write having succeeded.
+    pub fn try_save(&self) -> std::io::Result<()> {
+        let s = toml::to_string(self)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        let path = Self::file();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Rename instead of writing in place: the store is read by both the ui and the
+        // service process, and a half written file makes `load` fall back to an empty
+        // store, silently dropping every config.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, s)?;
+        std::fs::rename(&tmp, path)?;
         // Keep the shared copy in step, so that `load`, which prefers it, hands back what was
         // just saved. Without this an edit is silently reverted: the write lands in the file,
         // the next read comes from the still stale option, and republishing that option puts
@@ -637,6 +647,7 @@ impl MultiServerStore {
         if !Config::get_option(OPTION_MULTI_SERVER_STORE).is_empty() && Self::can_publish() {
             self.publish();
         }
+        Ok(())
     }
 
     /// Load the store for reading, capped at [`MAX_SERVER_CONFIGS`] entries.
@@ -2265,6 +2276,24 @@ impl Config {
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
         res
+    }
+
+    /// The value stored for `k`, without the defaults and the overwrite settings
+    /// [`Self::get_option`] falls back to.
+    ///
+    /// The effective one answers the preset for a key nobody ever wrote, so a caller that has
+    /// to tell "never set" from "preset by the build" cannot use it.
+    pub fn get_stored_option(k: &str) -> Option<String> {
+        CONFIG2.read().unwrap().options.get(k).cloned()
+    }
+
+    /// The stored options only, without the defaults and the overwrite settings
+    /// [`Self::get_options`] mixes in.
+    ///
+    /// Handing the merged map to another process would persist every default there, which is
+    /// what then makes [`Self::get_stored_option`] start answering presets.
+    pub fn get_stored_options() -> HashMap<String, String> {
+        CONFIG2.read().unwrap().options.clone()
     }
 
     #[inline]
