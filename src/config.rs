@@ -322,20 +322,30 @@ impl ServerConfig {
     // dec: 多配置支持 - 配置校验方法
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.name.is_empty() {
-            return Err(ConfigError::InvalidFormat("配置名称不能为空".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Config name is required".to_string(),
+            ));
         }
         if self.name.len() > 50 {
-            return Err(ConfigError::InvalidFormat("配置名称不能超过50个字符".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Config name cannot exceed 50 characters".to_string(),
+            ));
         }
         if self.id_server.is_empty() {
-            return Err(ConfigError::InvalidFormat("ID服务器地址不能为空".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "ID server address is required".to_string(),
+            ));
         }
         if self.id_port == 0 || self.id_port > 65535 {
-            return Err(ConfigError::InvalidFormat("ID服务器端口范围无效".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Invalid ID server port".to_string(),
+            ));
         }
         if let Some(port) = self.relay_port {
             if port == 0 || port > 65535 {
-                return Err(ConfigError::InvalidFormat("中继服务器端口范围无效".to_string()));
+                return Err(ConfigError::InvalidFormat(
+                    "Invalid relay server port".to_string(),
+                ));
             }
         }
         Ok(())
@@ -368,17 +378,23 @@ impl ConfigValidator {
 
     pub fn validate_name(name: &str) -> Result<(), ConfigError> {
         if name.is_empty() {
-            return Err(ConfigError::InvalidFormat("配置名称不能为空".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Config name is required".to_string(),
+            ));
         }
         if name.len() > 50 {
-            return Err(ConfigError::InvalidFormat("配置名称不能超过50个字符".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Config name cannot exceed 50 characters".to_string(),
+            ));
         }
         Ok(())
     }
 
     pub fn validate_server_address(addr: &str) -> Result<(), ConfigError> {
         if addr.is_empty() {
-            return Err(ConfigError::InvalidFormat("服务器地址不能为空".to_string()));
+            return Err(ConfigError::InvalidFormat(
+                "Server address is required".to_string(),
+            ));
         }
         Ok(())
     }
@@ -393,42 +409,48 @@ impl ConfigValidator {
 }
 
 // dec: 多配置支持 - 错误类型定义
+///
+/// The messages are English sentences on purpose: `hbb_common` has no translation facility, so
+/// the caller runs the message through `translate`, which treats the sentence itself as the key
+/// and falls back to it when no translation exists.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("配置名称已存在")]
+    #[error("Duplicate config name")]
     DuplicateName,
-    #[error("该ID服务器配置已存在")]
+    #[error("This ID server address already exists")]
     DuplicateServer,
     // Keep the number in sync with MAX_SERVER_CONFIGS.
-    #[error("已达到最大配置数量（5个）")]
+    #[error("Maximum of 5 configs reached")]
     MaxLimitReached,
-    #[error("不能删除最后一个配置")]
+    #[error("The last config cannot be deleted")]
     LastConfigCannotDelete,
-    #[error("默认配置不允许删除")]
+    #[error("The default config cannot be deleted")]
     DefaultConfigCannotDelete,
-    #[error("默认配置固定置顶，不可调整优先级")]
+    #[error("The default config is pinned to the top")]
     DefaultConfigCannotMove,
-    #[error("优先级位置无效")]
+    #[error("Invalid priority position")]
     InvalidPriority,
-    #[error("配置格式错误: {0}")]
+    // The detail is the whole message, so it stays a single translatable key.
+    #[error("{0}")]
     InvalidFormat(String),
-    #[error("配置不存在")]
+    #[error("Config not found")]
     ConfigNotFound,
-    #[error("存储错误: {0}")]
+    #[error("Storage error: {0}")]
     StorageError(String),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchError {
-    #[error("配置不存在")]
+    #[error("Config not found")]
     ConfigNotFound,
-    #[error("配置不可用: {0}")]
+    // The detail is the whole message, so it stays a single translatable key.
+    #[error("{0}")]
     ConfigUnavailable(String),
-    #[error("请先断开远程连接再切换配置")]
+    #[error("Disconnect the remote session before switching config")]
     ConnectionInProgress,
-    #[error("配置保存失败: {0}")]
+    #[error("Failed to save config: {0}")]
     StorageFailed(String),
-    #[error("切换保护中，请稍后重试")]
+    #[error("Switching is protected, try again later")]
     SwitchProtected,
 }
 
@@ -1015,20 +1037,20 @@ impl ConfigManager {
         ServerConfigRepository::load_all()
     }
 
+    /// Make `config_id` the default and move it to the top, the highest priority position.
+    ///
+    /// This only decides which config a failover, or a switch back once a higher priority one
+    /// is reachable again, prefers. It deliberately leaves the server the connection is on
+    /// alone, that is what switching is for.
+    ///
+    /// Same shape as what the sync does when the single server settings change, so the default
+    /// always sits at index 0, which is what the ui and the failover rely on.
     pub fn set_default_config(config_id: &str) -> Result<(), ConfigError> {
         let mut store = MultiServerStore::load();
-        let mut found = false;
-        for c in store.rendezvous_servers.iter_mut() {
-            if c.id == config_id {
-                c.is_default = true;
-                found = true;
-            } else {
-                c.is_default = false;
-            }
-        }
-        if !found {
+        if !store.rendezvous_servers.iter().any(|c| c.id == config_id) {
             return Err(ConfigError::ConfigNotFound);
         }
+        ServerConfigRepository::promote_default(&mut store, config_id);
         store.save();
         Ok(())
     }
@@ -1168,7 +1190,9 @@ impl ManualSwitcher {
         // 持久化配置
         
         if AvailabilityChecker::check_id_server(config) != ServerStatus::Available {
-            return Err(SwitchError::ConfigUnavailable("ID服务器不可用".to_string()));
+            return Err(SwitchError::ConfigUnavailable(
+                "The ID server is unreachable".to_string(),
+            ));
         }
         
         ServerConfigRepository::save_current(&config.id)
@@ -5240,12 +5264,74 @@ mod tests_multi_config {
     #[test]
     fn test_config_error_display() {
         let err = ConfigError::DuplicateName;
-        assert_eq!(err.to_string(), "配置名称已存在");
+        assert_eq!(err.to_string(), "Duplicate config name");
 
         let err = ConfigError::MaxLimitReached;
-        assert_eq!(err.to_string(), "已达到最大配置数量（5个）");
+        assert_eq!(err.to_string(), "Maximum of 5 configs reached");
 
-        let err = SwitchError::ConfigUnavailable("test".to_string());
-        assert!(err.to_string().contains("配置不可用"));
+        // The detail is the whole message, so it is what the ui translates.
+        let err = SwitchError::ConfigUnavailable("The ID server is unreachable".to_string());
+        assert_eq!(err.to_string(), "The ID server is unreachable");
+    }
+
+    /// `set_default_config` only delegates to this, and the ui assumes index 0 is the default,
+    /// so the reordering is worth pinning down. Kept in memory because the store is the real
+    /// config file.
+    #[test]
+    fn test_promote_default_pins_to_top() {
+        let configs = vec![
+            ServerConfig {
+                id: "id1".to_string(),
+                name: "Config1".to_string(),
+                id_server: "server1.com".to_string(),
+                is_default: true,
+                ..Default::default()
+            },
+            ServerConfig {
+                id: "id2".to_string(),
+                name: "Config2".to_string(),
+                id_server: "server2.com".to_string(),
+                ..Default::default()
+            },
+            ServerConfig {
+                id: "id3".to_string(),
+                name: "Config3".to_string(),
+                id_server: "server3.com".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut store = MultiServerStore {
+            rendezvous_servers: configs,
+            current_config_id: None,
+        };
+
+        assert!(ServerConfigRepository::promote_default(&mut store, "id3"));
+
+        let ids = store
+            .rendezvous_servers
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["id3", "id1", "id2"]);
+        assert_eq!(
+            store
+                .rendezvous_servers
+                .iter()
+                .filter(|c| c.is_default)
+                .count(),
+            1,
+            "the previous default must be demoted, exactly one stays"
+        );
+        assert!(store.rendezvous_servers[0].is_default);
+
+        // Promoting the config that already leads must not report a change.
+        assert!(!ServerConfigRepository::promote_default(&mut store, "id3"));
+    }
+
+    /// An unknown id has to be rejected instead of demoting every config and leaving the list
+    /// without a default. Read only: the store is the real config file.
+    #[test]
+    fn test_set_default_config_rejects_unknown_id() {
+        assert!(ConfigManager::set_default_config("missing").is_err());
     }
 }
