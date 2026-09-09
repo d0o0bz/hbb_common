@@ -500,6 +500,14 @@ impl MultiServerStore {
         Config::file_(MULTI_CONFIG_SUFFIX)
     }
 
+    /// 配置文件所在目录，供界面直接打开。
+    pub fn dir() -> PathBuf {
+        Self::file()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default()
+    }
+
     fn load_file() -> Self {
         if let Ok(s) = std::fs::read_to_string(Self::file()) {
             toml::from_str(&s).unwrap_or_default()
